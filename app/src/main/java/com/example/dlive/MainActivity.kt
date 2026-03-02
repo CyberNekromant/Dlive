@@ -1,8 +1,10 @@
 package com.example.dlive
 
+import android.Manifest
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -50,6 +52,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextField
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateListOf
@@ -68,6 +71,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -87,66 +91,39 @@ import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
-// --- 1. МОДЕЛИ ДАННЫХ ---
-data class SimpleNote(
-    val id: String,
-    val text: String,
-    val label: String,
-    val isAlert: Boolean
-)
+// --- МОДЕЛИ И МЕНЕДЖЕР (БЕЗ ИЗМЕНЕНИЙ) ---
+data class SimpleNote(val id: String, val text: String, val label: String, val isAlert: Boolean)
+data class SimplePet(val id: String, val name: String, val photo: String?, val notes: MutableList<SimpleNote> = mutableListOf())
 
-data class SimplePet(
-    val id: String,
-    val name: String,
-    val photo: String?,
-    val notes: MutableList<SimpleNote> = mutableListOf()
-)
-
-// --- 2. МЕНЕДЖЕР ХРАНИЛИЩА ---
 class DataManager(context: Context) {
     private val prefs = context.getSharedPreferences("dlive_final_prefs", Context.MODE_PRIVATE)
     private val gson = Gson()
-
-    fun save(pets: List<SimplePet>) {
-        val json = gson.toJson(pets)
-        prefs.edit().putString("data", json).apply()
-    }
-
+    fun save(pets: List<SimplePet>) { prefs.edit().putString("data", gson.toJson(pets)).apply() }
     fun load(): List<SimplePet> {
         val json = prefs.getString("data", null) ?: return emptyList()
-        val type = object : TypeToken<List<SimplePet>>() {}.type
-        return gson.fromJson(json, type)
+        return gson.fromJson(json, object : TypeToken<List<SimplePet>>() {}.type)
     }
 }
 
-// --- 3. ВОРКЕР ДЛЯ УВЕДОМЛЕНИЙ ---
+// --- ВОРКЕР (БЕЗ ИЗМЕНЕНИЙ) ---
 class NotificationWorker(context: Context, params: WorkerParameters) : Worker(context, params) {
     override fun doWork(): Result {
         val note = inputData.getString("note") ?: "Напоминание"
         val petName = inputData.getString("pet") ?: "Питомец"
-
         val manager = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val chId = "dlive_reminders"
-
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(chId, "Напоминания DLive", NotificationManager.IMPORTANCE_HIGH)
-            manager.createNotificationChannel(channel)
+            manager.createNotificationChannel(NotificationChannel(chId, "DLive", NotificationManager.IMPORTANCE_HIGH))
         }
-
         val notification = NotificationCompat.Builder(applicationContext, chId)
             .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
-            .setContentTitle(petName)
-            .setContentText(note)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setAutoCancel(true)
-            .build()
-
+            .setContentTitle(petName).setContentText(note).setPriority(NotificationCompat.PRIORITY_HIGH).setAutoCancel(true).build()
         manager.notify(System.currentTimeMillis().toInt(), notification)
         return Result.success()
     }
 }
 
-// --- 4. ОСНОВНОЙ ЭКРАН ---
+// --- ACTIVITY С ЗАПРОСОМ РАЗРЕШЕНИЙ ---
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -156,17 +133,28 @@ class MainActivity : ComponentActivity() {
             val navController = rememberNavController()
             val pets = remember { mutableStateListOf<SimplePet>().apply { addAll(manager.load()) } }
 
+            // --- ЛОГИКА ЗАПРОСА ПРАВ ---
+            val permissionLauncher = rememberLauncherForActivityResult(
+                ActivityResultContracts.RequestPermission()
+            ) { isGranted ->
+                if (!isGranted) {
+                    Toast.makeText(this, "Уведомления отключены. Вы не получите напоминаний!", Toast.LENGTH_LONG).show()
+                }
+            }
+
+            LaunchedEffect(Unit) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                }
+            }
+
             MaterialTheme {
                 Surface(color = Color.White, modifier = Modifier.fillMaxSize()) {
                     NavHost(navController, startDestination = "main") {
-                        composable("main") {
-                            MainScreen(pets, onSave = { manager.save(pets) }, navController)
-                        }
+                        composable("main") { MainScreen(pets, { manager.save(pets) }, navController) }
                         composable("details/{id}", arguments = listOf(navArgument("id") { type = NavType.StringType })) { b ->
                             val id = b.arguments?.getString("id")
-                            DetailsScreen(pets.find { it.id == id }, onSave = { manager.save(pets) }) {
-                                navController.popBackStack()
-                            }
+                            DetailsScreen(pets.find { it.id == id }, { manager.save(pets) }) { navController.popBackStack() }
                         }
                     }
                 }
@@ -174,6 +162,8 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
+
+// --- ЭКРАНЫ (ОБНОВЛЕНА ЛОГИКА КНОПКИ НАПОМНИТЬ) ---
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -184,7 +174,6 @@ fun MainScreen(pets: MutableList<SimplePet>, onSave: () -> Unit, nav: androidx.n
 
     Column(Modifier.padding(16.dp).fillMaxSize()) {
         Text("DLive 🐾", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = Color.Black)
-
         Card(Modifier.padding(vertical = 12.dp).fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = Color(0xFFF5F5F5))) {
             Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.size(64.dp).clip(CircleShape).background(Color.LightGray).clickable { picker.launch("image/*") }) {
@@ -199,16 +188,11 @@ fun MainScreen(pets: MutableList<SimplePet>, onSave: () -> Unit, nav: androidx.n
                     pets.add(SimplePet(UUID.randomUUID().toString(), name.trim(), photoUri?.toString()))
                     onSave(); name = ""; photoUri = null
                 }
-            }, Modifier.fillMaxWidth().padding(8.dp)) { Text("ДОБАВИТЬ ПИТОМЦА") }
+            }, Modifier.fillMaxWidth().padding(8.dp)) { Text("ДОБАВИТЬ") }
         }
-
         LazyColumn {
             items(pets) { pet ->
-                Row(
-                    Modifier.fillMaxWidth().padding(vertical = 6.dp).background(Color(0xFFEEEEEE), RoundedCornerShape(12.dp))
-                        .clickable { nav.navigate("details/${pet.id}") }.padding(12.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
+                Row(Modifier.fillMaxWidth().padding(vertical = 6.dp).background(Color(0xFFEEEEEE), RoundedCornerShape(12.dp)).clickable { nav.navigate("details/${pet.id}") }.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                     if (pet.photo != null) AsyncImage(Uri.parse(pet.photo), null, Modifier.size(50.dp).clip(CircleShape), contentScale = ContentScale.Crop)
                     else Icon(Icons.Default.Pets, null, Modifier.size(50.dp), tint = Color.Gray)
                     Text(pet.name, Modifier.padding(start = 12.dp).weight(1f), color = Color.Black, fontSize = 20.sp, fontWeight = FontWeight.Bold)
@@ -235,19 +219,14 @@ fun DetailsScreen(pet: SimplePet?, onSave: () -> Unit, onBack: () -> Unit) {
             IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, null, tint = Color.Black) }
             Text(pet.name, fontSize = 24.sp, fontWeight = FontWeight.Bold, color = Color.Black)
         }
-
         OutlinedTextField(noteMsg, { noteMsg = it }, label = { Text("О чем напомнить?") }, modifier = Modifier.fillMaxWidth(), textStyle = TextStyle(color = Color.Black))
-
         Row(Modifier.padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             TextField(timeVal, { if(it.all { c -> c.isDigit() }) timeVal = it }, Modifier.width(70.dp), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
             Spacer(Modifier.width(8.dp))
-            units.forEach { u ->
-                FilterChip(selected = selectedUnit == u, onClick = { selectedUnit = u }, label = { Text(u) }, modifier = Modifier.padding(end = 4.dp))
-            }
+            units.forEach { u -> FilterChip(selected = selectedUnit == u, onClick = { selectedUnit = u }, label = { Text(u) }, modifier = Modifier.padding(end = 4.dp)) }
         }
-
         Row(Modifier.padding(top = 16.dp)) {
-            Button(onClick = {
+            Button({
                 if (noteMsg.isNotBlank()) {
                     val time = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
                     pet.notes.add(0, SimpleNote(UUID.randomUUID().toString(), noteMsg.trim(), "Запись: $time", false))
@@ -255,29 +234,27 @@ fun DetailsScreen(pet: SimplePet?, onSave: () -> Unit, onBack: () -> Unit) {
                 }
             }, Modifier.weight(1f).padding(end = 4.dp), colors = ButtonDefaults.buttonColors(containerColor = Color.LightGray)) { Text("ЗАМЕТКА", color = Color.Black) }
 
-            Button(onClick = {
+            Button({
                 if (noteMsg.isNotBlank()) {
-                    val delay = timeVal.toLongOrNull() ?: 1L
-                    val ms = when(selectedUnit) { "Мин" -> delay; "Час" -> delay * 60; else -> delay * 1440 }
+                    // ПРОВЕРКА РАЗРЕШЕНИЯ ПЕРЕД ОТПРАВКОЙ
+                    val hasPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+                    } else true
 
-                    // Сохраняем в список
-                    pet.notes.add(0, SimpleNote(UUID.randomUUID().toString(), noteMsg.trim(), "Будильник через $delay $selectedUnit", true))
-
-                    // Ставим уведомление
-                    val data = workDataOf("note" to noteMsg.trim(), "pet" to pet.name)
-                    val req = OneTimeWorkRequestBuilder<NotificationWorker>()
-                        .setInitialDelay(ms, TimeUnit.MINUTES)
-                        .setInputData(data)
-                        .build()
-                    WorkManager.getInstance(ctx).enqueue(req)
-
-                    onSave(); noteMsg = ""; refresh++; Toast.makeText(ctx, "Напоминание поставлено!", Toast.LENGTH_SHORT).show()
+                    if (hasPermission) {
+                        val delay = timeVal.toLongOrNull() ?: 1L
+                        val ms = when(selectedUnit) { "Мин" -> delay; "Час" -> delay * 60; else -> delay * 1440 }
+                        pet.notes.add(0, SimpleNote(UUID.randomUUID().toString(), noteMsg.trim(), "Будильник через $delay $selectedUnit", true))
+                        val data = workDataOf("note" to noteMsg.trim(), "pet" to pet.name)
+                        val req = OneTimeWorkRequestBuilder<NotificationWorker>().setInitialDelay(ms, TimeUnit.MINUTES).setInputData(data).build()
+                        WorkManager.getInstance(ctx).enqueue(req)
+                        onSave(); noteMsg = ""; refresh++; Toast.makeText(ctx, "Напоминание создано!", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(ctx, "Разрешите уведомления в настройках телефона!", Toast.LENGTH_LONG).show()
+                    }
                 }
             }, Modifier.weight(1f)) { Text("НАПОМНИТЬ") }
         }
-
-        Text("ИСТОРИЯ", Modifier.padding(top = 20.dp), fontWeight = FontWeight.Bold, color = Color.Black)
-
         key(refresh) {
             LazyColumn(Modifier.fillMaxSize().padding(top = 8.dp)) {
                 items(pet.notes) { note ->
@@ -287,9 +264,7 @@ fun DetailsScreen(pet: SimplePet?, onSave: () -> Unit, onBack: () -> Unit) {
                             Text(note.text, color = Color.Black, fontSize = 16.sp, fontWeight = FontWeight.Medium)
                             Text(note.label, color = Color.Gray, fontSize = 12.sp)
                         }
-                        IconButton({ pet.notes.remove(note); onSave(); refresh++ }) {
-                            Icon(Icons.Default.Close, null, Modifier.size(18.dp), tint = Color.LightGray)
-                        }
+                        IconButton({ pet.notes.remove(note); onSave(); refresh++ }) { Icon(Icons.Default.Close, null, Modifier.size(18.dp), tint = Color.LightGray) }
                     }
                 }
             }
